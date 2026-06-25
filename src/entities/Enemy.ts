@@ -1,164 +1,262 @@
 import Phaser from 'phaser';
 import {
-  ENEMY_SPEED, ENEMY_CHASE_RANGE, ENEMY_ATTACK_RANGE,
-  ENEMY_ATTACK_DAMAGE, ENEMY_ATTACK_COOLDOWN, ENEMY_HP,
-  ENEMY_SOULS, COLORS,
+  HOLLOW_SPEED, HOLLOW_CHASE_RANGE, HOLLOW_ATTACK_RANGE,
+  HOLLOW_DAMAGE, HOLLOW_ATK_CD, HOLLOW_HP, HOLLOW_SOULS, HOLLOW_POISE,
+  KNIGHT_SPEED, KNIGHT_CHASE_RANGE, KNIGHT_ATTACK_RANGE,
+  KNIGHT_DAMAGE, KNIGHT_ATK_CD, KNIGHT_HP, KNIGHT_SOULS, KNIGHT_POISE,
+  C,
 } from '../utils/constants';
 
-export type EnemyState = 'idle' | 'patrol' | 'chase' | 'attack' | 'hurt' | 'dead';
+export type EnemyType = 'hollow' | 'knight';
+export type EnemyState = 'patrol' | 'chase' | 'attack' | 'staggered' | 'riposte_vulnerable' | 'dead';
 
 export class Enemy extends Phaser.GameObjects.Container {
   private sprite!: Phaser.Physics.Arcade.Sprite;
-  private hp: number = ENEMY_HP;
-  private maxHp: number = ENEMY_HP;
-  private enemyState: EnemyState = 'idle';
-  private facingRight: boolean = true;
-  private attackCooldown: number = 0;
-  private hurtTimer: number = 0;
-  private patrolTarget: Phaser.Math.Vector2 = new Phaser.Math.Vector2();
-  private patrolWaitTimer: number = 0;
-  private spawnX: number = 0;
-  private spawnY: number = 0;
-  private patrolRadius: number = 80;
-  private soulsValue: number = ENEMY_SOULS;
-  private alive: boolean = true;
-  private isAttacking: boolean = false;
+  private hp: number;
+  private maxHp: number;
+  private enemyState: EnemyState = 'patrol';
+  private facingRight = true;
+  private atkCd = 0;
+  private hurtTimer = 0;
+  private staggerTimer = 0;
+  private riposteVulnTimer = 0;
+  private patrolTarget = new Phaser.Math.Vector2();
+  private patrolWait = 0;
+  private spawnX: number;
+  private spawnY: number;
+  private patrolRadius: number;
+  private soulsValue: number;
+  private alive = true;
+  private isAttacking = false;
+  private poise: number;
+  private maxPoise: number;
+  private poiseRegenTimer = 0;
+  private type: EnemyType;
+  private isBlocking = false;
 
   public onDeath?: (x: number, y: number, souls: number) => void;
   public onAttack?: (x: number, y: number, dir: Phaser.Math.Vector2, damage: number) => void;
+  public onStagger?: (x: number, y: number) => void;
 
-  constructor(scene: Phaser.Scene, x: number, y: number, patrolRadius: number = 80) {
+  constructor(scene: Phaser.Scene, x: number, y: number, type: EnemyType = 'hollow', patrolRadius = 80) {
     super(scene, x, y);
     (scene.add as any).existing(this);
-    this.spawnX = x;
-    this.spawnY = y;
-    this.patrolRadius = patrolRadius;
+    this.spawnX = x; this.spawnY = y; this.patrolRadius = patrolRadius; this.type = type;
 
-    this.sprite = scene.physics.add.sprite(0, 0, 'enemy');
-    this.sprite.setOrigin(0.5, 0.7);
+    const tex = type === 'knight' ? 'knight_idle' : 'hollow_idle';
+    this.sprite = scene.physics.add.sprite(0, 0, tex);
+    this.sprite.setOrigin(0.5, 0.75);
     this.sprite.setDepth(9);
     this.add(this.sprite);
 
-    this.pickNewPatrolTarget();
-    this.enemyState = 'patrol';
-  }
-
-  getBody(): Phaser.Physics.Arcade.Sprite { return this.sprite; }
-  isAlive(): boolean { return this.alive; }
-
-  update(delta: number, playerX: number, playerY: number): void {
-    if (!this.alive) return;
-    const dt = delta / 1000;
-    this.attackCooldown = Math.max(0, this.attackCooldown - delta);
-    this.hurtTimer = Math.max(0, this.hurtTimer - delta);
-
-    if (this.hurtTimer > 0) {
-      this.sprite.setTint(0xff6666);
-      this.sprite.setVelocity(0, 0);
-      return;
+    if (type === 'knight') {
+      this.hp = KNIGHT_HP; this.maxHp = KNIGHT_HP;
+      this.soulsValue = KNIGHT_SOULS; this.poise = KNIGHT_POISE; this.maxPoise = KNIGHT_POISE;
     } else {
-      this.sprite.clearTint();
+      this.hp = HOLLOW_HP; this.maxHp = HOLLOW_HP;
+      this.soulsValue = HOLLOW_SOULS; this.poise = HOLLOW_POISE; this.maxPoise = HOLLOW_POISE;
     }
 
+    this.pickPatrol();
+  }
+
+  getBody() { return this.sprite; }
+  isAlive() { return this.alive; }
+  getType() { return this.type; }
+  getIsParryable() { return this.isAttacking; }
+  getIsStaggered() { return this.enemyState === 'staggered'; }
+  getIsRipostable() { return this.enemyState === 'riposte_vulnerable'; }
+
+  update(delta: number, px: number, py: number, playerIsParrying: boolean = false): void {
+    if (!this.alive) return;
+    const dt = delta / 1000;
+    this.atkCd = Math.max(0, this.atkCd - delta);
+    this.hurtTimer = Math.max(0, this.hurtTimer - delta);
+    this.staggerTimer = Math.max(0, this.staggerTimer - delta);
+    this.riposteVulnTimer = Math.max(0, this.riposteVulnTimer - delta);
+    this.poiseRegenTimer += delta;
+
+    // Poise regen (slow, out of combat)
+    if (this.poiseRegenTimer > 3000 && this.poise < this.maxPoise) {
+      this.poise = Math.min(this.maxPoise, this.poise + 5 * dt);
+    }
+
+    // Stagger state
+    if (this.enemyState === 'staggered') {
+      this.sprite.setTint(0xffcc44);
+      this.sprite.setVelocity(0, 0);
+      if (this.staggerTimer <= 0) {
+        this.sprite.clearTint();
+        this.setTexture('idle');
+        this.enemyState = 'patrol';
+        this.pickPatrol();
+      }
+      return;
+    }
+
+    // Riposte vulnerable
+    if (this.enemyState === 'riposte_vulnerable') {
+      this.sprite.setTint(0xffff88);
+      this.sprite.setVelocity(0, 0);
+      if (this.riposteVulnTimer <= 0) {
+        this.sprite.clearTint();
+        this.setTexture('idle');
+        this.enemyState = 'staggered';
+        this.staggerTimer = 1200;
+      }
+      return;
+    }
+
+    if (this.hurtTimer > 0) { this.sprite.setTint(0xff6666); this.sprite.setVelocity(0, 0); return; }
+    else this.sprite.clearTint();
     if (this.isAttacking) return;
 
-    const dx = playerX - this.x;
-    const dy = playerY - this.y;
+    const dx = px - this.x, dy = py - this.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
+    const speed = this.type === 'knight' ? KNIGHT_SPEED : HOLLOW_SPEED;
+    const chaseRange = this.type === 'knight' ? KNIGHT_CHASE_RANGE : HOLLOW_CHASE_RANGE;
+    const atkRange = this.type === 'knight' ? KNIGHT_ATTACK_RANGE : HOLLOW_ATTACK_RANGE;
+
+    // Knight blocking behavior
+    if (this.type === 'knight' && dist < atkRange * 2.5 && dist > atkRange && !playerIsParrying) {
+      this.isBlocking = true;
+      this.setTexture('block');
+    } else {
+      this.isBlocking = false;
+    }
 
     switch (this.enemyState) {
       case 'patrol':
         this.updatePatrol(dt);
-        if (dist < ENEMY_CHASE_RANGE) this.enemyState = 'chase';
+        if (dist < chaseRange) this.enemyState = 'chase';
         break;
       case 'chase':
-        this.updateChase(dx, dy, dist);
-        break;
-      case 'attack':
+        if (dist > chaseRange * 1.5) { this.enemyState = 'patrol'; this.pickPatrol(); return; }
+        if (dist < atkRange && this.atkCd <= 0) { this.performAttack(dx, dy, dist); return; }
+        this.sprite.setVelocity((dx / dist) * speed, (dy / dist) * speed);
+        if (dx > 0) this.facingRight = true; else if (dx < 0) this.facingRight = false;
+        if (!this.isBlocking) this.setTexture('idle');
+        this.sprite.setFlipX(!this.facingRight);
         break;
     }
   }
 
   private updatePatrol(dt: number): void {
-    const dx = this.patrolTarget.x - this.x;
-    const dy = this.patrolTarget.y - this.y;
+    const dx = this.patrolTarget.x - this.x, dy = this.patrolTarget.y - this.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
-
+    const speed = (this.type === 'knight' ? KNIGHT_SPEED : HOLLOW_SPEED) * 0.4;
     if (dist < 8) {
-      this.patrolWaitTimer -= dt * 1000;
-      if (this.patrolWaitTimer <= 0) this.pickNewPatrolTarget();
+      this.patrolWait -= dt * 1000;
+      if (this.patrolWait <= 0) this.pickPatrol();
       this.sprite.setVelocity(0, 0);
     } else {
-      const speed = ENEMY_SPEED * 0.5;
       this.sprite.setVelocity((dx / dist) * speed, (dy / dist) * speed);
-      if (dx > 0) this.facingRight = true;
-      else if (dx < 0) this.facingRight = false;
+      if (dx > 0) this.facingRight = true; else if (dx < 0) this.facingRight = false;
     }
     this.sprite.setFlipX(!this.facingRight);
-  }
-
-  private updateChase(dx: number, dy: number, dist: number): void {
-    if (dist > ENEMY_CHASE_RANGE * 1.5) {
-      this.enemyState = 'patrol';
-      this.pickNewPatrolTarget();
-      return;
-    }
-    if (dist < ENEMY_ATTACK_RANGE && this.attackCooldown <= 0) {
-      this.performAttack(dx, dy, dist);
-      return;
-    }
-    const speed = ENEMY_SPEED;
-    this.sprite.setVelocity((dx / dist) * speed, (dy / dist) * speed);
-    if (dx > 0) this.facingRight = true;
-    else if (dx < 0) this.facingRight = false;
-    this.sprite.setFlipX(!this.facingRight);
+    this.setTexture('idle');
   }
 
   private performAttack(dx: number, dy: number, dist: number): void {
-    this.enemyState = 'attack';
-    this.isAttacking = true;
-    this.sprite.setVelocity(0, 0);
-    this.sprite.setTexture('enemy_attack');
+    this.enemyState = 'attack'; this.isAttacking = true; this.isBlocking = false;
+    this.sprite.setVelocity(0, 0); this.setTexture('attack');
+    const dmg = this.type === 'knight' ? KNIGHT_DAMAGE : HOLLOW_DAMAGE;
+    const range = this.type === 'knight' ? KNIGHT_ATTACK_RANGE : HOLLOW_ATTACK_RANGE;
+    const cd = this.type === 'knight' ? KNIGHT_ATK_CD : HOLLOW_ATK_CD;
 
-    this.scene.time.delayedCall(300, () => {
+    this.scene.time.delayedCall(this.type === 'knight' ? 400 : 300, () => {
       if (!this.alive) return;
-      this.sprite.setTexture('enemy');
-      if (dist < ENEMY_ATTACK_RANGE * 1.5) {
+      this.setTexture('idle');
+      if (dist < range * 1.8) {
         const dir = new Phaser.Math.Vector2(dx, dy).normalize();
-        if (this.onAttack) {
-          this.onAttack(this.x + dir.x * ENEMY_ATTACK_RANGE, this.y + dir.y * ENEMY_ATTACK_RANGE * 0.5, dir, ENEMY_ATTACK_DAMAGE);
-        }
+        if (this.onAttack) this.onAttack(this.x + dir.x * range, this.y + dir.y * range * 0.5, dir, dmg);
       }
-      this.attackCooldown = ENEMY_ATTACK_COOLDOWN;
-      this.isAttacking = false;
-      this.enemyState = 'patrol';
+      this.atkCd = cd; this.isAttacking = false; this.enemyState = 'patrol';
     });
   }
 
-  private pickNewPatrolTarget(): void {
-    const angle = Phaser.Math.FloatBetween(0, Math.PI * 2);
-    const radius = Phaser.Math.FloatBetween(20, this.patrolRadius);
-    this.patrolTarget.set(this.spawnX + Math.cos(angle) * radius, this.spawnY + Math.sin(angle) * radius);
-    this.patrolWaitTimer = Phaser.Math.Between(500, 2000);
+  takeDamage(amount: number, knockbackDir?: Phaser.Math.Vector2): boolean {
+    if (!this.alive) return false;
+
+    // Knight blocking reduces damage
+    if (this.isBlocking) {
+      amount = Math.floor(amount * 0.2);
+      this.poise += amount * 0.5;
+      this.scene.cameras.main.shake(40, 0.003);
+    }
+
+    this.hp -= amount;
+    this.hurtTimer = 150;
+    this.poiseRegenTimer = 0;
+    if (knockbackDir) {
+      const kb = this.type === 'knight' ? 100 : 200;
+      this.sprite.setVelocity(knockbackDir.x * kb, knockbackDir.y * kb);
+    }
+    if (this.hp <= 0) { this.die(); return true; }
+    return true;
   }
 
-  takeDamage(amount: number, knockbackDir?: Phaser.Math.Vector2): void {
+  applyPoiseDamage(amount: number): void {
+    this.poise -= amount;
+    this.poiseRegenTimer = 0;
+    if (this.poise <= 0) {
+      this.stagger(amount);
+    }
+  }
+
+  stagger(damage: number = 0): void {
     if (!this.alive) return;
-    this.hp -= amount;
-    this.hurtTimer = 200;
-    if (knockbackDir) this.sprite.setVelocity(knockbackDir.x * 200, knockbackDir.y * 200);
-    if (this.hp <= 0) this.die();
+    this.poise = 0;
+    this.enemyState = 'staggered';
+    this.staggerTimer = this.type === 'knight' ? 1500 : 1000;
+    this.isAttacking = false;
+    this.sprite.setVelocity(0, 0);
+    this.setTexture('stagger');
+    if (this.hp > 0 && damage > 0) {
+      this.hp -= damage;
+      if (this.hp <= 0) { this.die(); return; }
+    }
+    if (this.onStagger) this.onStagger(this.x, this.y);
+  }
+
+  enterRiposteVulnerable(): void {
+    this.enemyState = 'riposte_vulnerable';
+    this.riposteVulnTimer = 2000;
+    this.isAttacking = false;
+    this.sprite.setVelocity(0, 0);
+  }
+
+  takeRiposteDamage(damage: number): void {
+    if (!this.alive) return;
+    this.hp -= damage;
+    this.scene.cameras.main.shake(200, 0.012);
+    if (this.hp <= 0) { this.die(); return; }
+    // Long stagger after riposte
+    this.enemyState = 'staggered';
+    this.staggerTimer = 2000;
+    this.riposteVulnTimer = 0;
+    this.setTexture('stagger');
   }
 
   die(): void {
-    this.alive = false;
-    this.enemyState = 'dead';
-    this.sprite.setVelocity(0, 0);
-    this.sprite.setTint(COLORS.midGray);
+    this.alive = false; this.enemyState = 'dead';
+    this.sprite.setVelocity(0, 0); this.sprite.setTint(C.midGray);
     if (this.onDeath) this.onDeath(this.x, this.y, this.soulsValue);
-    this.scene.tweens.add({
-      targets: this, alpha: 0, duration: 600, delay: 300,
-      onComplete: () => this.destroy(),
-    });
+    this.scene.tweens.add({ targets: this, alpha: 0, duration: 800, delay: 400, onComplete: () => this.destroy() });
+  }
+
+  private pickPatrol(): void {
+    const a = Phaser.Math.FloatBetween(0, Math.PI * 2);
+    const r = Phaser.Math.FloatBetween(20, this.patrolRadius);
+    this.patrolTarget.set(this.spawnX + Math.cos(a) * r, this.spawnY + Math.sin(a) * r);
+    this.patrolWait = Phaser.Math.Between(500, 2500);
+  }
+
+  private setTexture(state: 'idle' | 'attack' | 'stagger' | 'block'): void {
+    const prefix = this.type === 'knight' ? 'knight' : 'hollow';
+    if (state === 'idle') this.sprite.setTexture(`${prefix}_idle`);
+    else if (state === 'attack') this.sprite.setTexture(`${prefix}_attack`);
+    else if (state === 'stagger') this.sprite.setTexture(`${prefix}_stagger`);
+    else if (state === 'block' && this.type === 'knight') this.sprite.setTexture('knight_block');
   }
 }
